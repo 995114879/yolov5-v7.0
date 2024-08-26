@@ -43,26 +43,26 @@ class Detect(nn.Module):
 
     def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
         super().__init__()
-        self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
-        self.nl = len(anchors)  # number of detection layers
-        self.na = len(anchors[0]) // 2  # number of anchors
-        self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid
-        self.anchor_grid = [torch.empty(0) for _ in range(self.nl)]  # init anchor grid
+        self.nc = nc  # number of classes 类别总数目
+        self.no = nc + 5  # number of outputs per anchor 针对每个anchor box/预测框对应的预测值维度数目
+        self.nl = len(anchors)  # number of detection layers 有几层做检测
+        self.na = len(anchors[0]) // 2  # number of anchors 每个锚点/grid对应几个anchor box/预测框
+        self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid 给定feature map上的grid单元格的坐标
+        self.anchor_grid = [torch.empty(0) for _ in range(self.nl)]  # init anchor grid 给定每个anchor box的尺度大小
         self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
-        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv 每一层的的输出卷积结构
         self.inplace = inplace  # use inplace ops (e.g. slice assignment)
 
     def forward(self, x):
         z = []  # inference output
         for i in range(self.nl):
-            x[i] = self.m[i](x[i])  # conv
+            x[i] = self.m[i](x[i])  # conv 提取当前第i层的前向输出值 [N,C,H,W] C=na*(nc+5)
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
             if not self.training:  # inference
                 if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
-                    self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
+                    self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)  # grid坐标构造
 
                 if isinstance(self, Segment):  # (boxes + masks)
                     xy, wh, conf, mask = x[i].split((2, 2, self.nc + 1, self.no - self.nc - 5), 4)
@@ -70,13 +70,24 @@ class Detect(nn.Module):
                     wh = (wh.sigmoid() * 2) ** 2 * self.anchor_grid[i]  # wh
                     y = torch.cat((xy, wh, conf.sigmoid(), mask), 4)
                 else:  # Detect (boxes only)
+                    # x[i] --> tx\ty\tw\th + class_score
                     xy, wh, conf = x[i].sigmoid().split((2, 2, self.nc + 1), 4)
                     xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
                     wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
                     y = torch.cat((xy, wh, conf), 4)
                 z.append(y.view(bs, self.na * nx * ny, self.no))
 
-        return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
+        if self.training:
+            return x
+        else:
+            z = torch.cat(z, 1)  # 推理时候的预测结果
+            if self.export:
+                # 当模型转换为静态结构(pt、onnx、tensorrt....)，只需要返回推理结果
+                return z,
+            else:
+                # 其它情况，返回推理结果 + 前向输出值
+                return z, x
+        # return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
 
     def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, '1.10.0')):
         d = self.anchors[i].device
@@ -114,12 +125,12 @@ class BaseModel(nn.Module):
     def _forward_once(self, x, profile=False, visualize=False):
         y, dt = [], []  # outputs
         for m in self.model:
-            if m.f != -1:  # if not from previous layer
+            if m.f != -1:  # if not from previous layer 当前层的输入，不是上一层的输出
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
-            x = m(x)  # run
-            y.append(x if m.i in self.save else None)  # save output
+            x = m(x)  # run 当前层&当前模块的前向过程(forward方法) 将当前层的输出作为下一层的输出
+            y.append(x if m.i in self.save else None)  # save output 针对跨层的输入结构，保存对应的层的输出值
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
         return x
@@ -166,6 +177,7 @@ class DetectionModel(BaseModel):
     # YOLOv5 detection model
     def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
         super().__init__()
+        # yaml文件的加载，最终形成dict字典
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
         else:  # is *.yaml
@@ -174,33 +186,38 @@ class DetectionModel(BaseModel):
             with open(cfg, encoding='ascii', errors='ignore') as f:
                 self.yaml = yaml.safe_load(f)  # model dict
 
-        # Define model
-        ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
+        # Define model 参数的定义/获取/覆盖
+        ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels 输入通道数目
         if nc and nc != self.yaml['nc']:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
         if anchors:
             LOGGER.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
+
+        # 模型构建
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+
+        # 获取名称
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         self.inplace = self.yaml.get('inplace', True)
 
-        # Build strides, anchors
+        # Build strides, anchors 构建各种后续代码需要的依赖属性(feature map的缩放系数)
         m = self.model[-1]  # Detect()
         if isinstance(m, (Detect, Segment)):
-            s = 256  # 2x min stride
+            s = 256  # 2x min stride 最小的图像输入尺度
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
+            # 基于前向的输出值，计算输出层和原始图像大小之间的缩放比例
             m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
             check_anchor_order(m)
-            m.anchors /= m.stride.view(-1, 1, 1)
+            m.anchors /= m.stride.view(-1, 1, 1)  # 将anchor box的大小从原始box大小，更改为在feature map上的尺度大小
             self.stride = m.stride
             self._initialize_biases()  # only run once
 
         # Init weights, biases
-        initialize_weights(self)
-        self.info()
+        initialize_weights(self)  # 参数初始化
+        self.info()  # 日志打印
         LOGGER.info('')
 
     def forward(self, x, augment=False, profile=False, visualize=False):
@@ -296,38 +313,47 @@ class ClassificationModel(BaseModel):
         self.model = None
 
 
-def parse_model(d, ch):  # model_dict, input_channels(3)
+def parse_model(d, ch):  # model_dict(网络结构的配置信息), input_channels(3)<ch:保存每个block块/模块/每层的输出通道数目>
     # Parse a YOLOv5 model.yaml dictionary
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
     anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
         LOGGER.info(f"{colorstr('activation:')} {act}")  # print
-    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors 每个锚点对应几个anchor box
+    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5) 总的输出维度大小(每个锚点对应的)
 
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    layers, save, c2 = [], [], ch[-1]  # layers 每个模块的对象, savelist 所有非-1的输入index, ch out 当前层的输出通道数目
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
-        m = eval(m) if isinstance(m, str) else m  # eval strings
+        m = eval(m) if isinstance(m, str) else m  # eval strings 执行字符串，也就是import对应的模块类(class)
         for j, a in enumerate(args):
-            with contextlib.suppress(NameError):
-                args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+            with contextlib.suppress(NameError):  # 不处理eval执行异常
+                args[j] = eval(a) if isinstance(a, str) else a  # eval strings 执行字符串进行替换
 
-        n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
+        # depth gain 模块的重复次数=number*depth_multiple ---> 控制模型深度
+        n = n_ = max(round(n * gd), 1) if n > 1 else n
+        # 特定模块进行入参的构造
         if m in {
-                Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x}:
-            c1, c2 = ch[f], args[0]
-            if c2 != no:  # if not output
+            Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
+            BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x,
+            DownSampling, UpSampling
+        }:
+
+            c1, c2 = ch[f], args[0]  # c1: 当前模块的输入通道数目，c2: 当前模块的输出通道数目
+            if c2 != no:  # if not output 如果输出通道数目不等于总的输出维度大小，那么进行缩放
+                # 修改输出的通道数目 ---> 控制模型的宽度 / 要求能够整除8  --> 输出通道数目=c2 * width_multiple
                 c2 = make_divisible(c2 * gw, 8)
 
-            args = [c1, c2, *args[1:]]
+            args = [c1, c2, *args[1:]]  # 重新构建模块的输入参数，eg: [输入通道，输出通道，其它参数]
             if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x}:
+                # 特殊模块处理，针对特点模块，将模块重复逻辑放到模块内部执行
                 args.insert(2, n)  # number of repeats
-                n = 1
+                n = 1  # 重置n=1
         elif m is nn.BatchNorm2d:
+            # BN只需要给定通道数目，也就是f层的输出通道数目即可
             args = [ch[f]]
         elif m is Concat:
+            # c2 --> 输出通道数目，Concat合并不就是通道数目的累加
             c2 = sum(ch[x] for x in f)
         # TODO: channel, gw, gd
         elif m in {Detect, Segment}:
@@ -341,18 +367,30 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is Expand:
             c2 = ch[f] // args[0] ** 2
         else:
-            c2 = ch[f]
+            c2 = ch[f]  # 直接将上一层的输出通道数目作为当前层的输出通道数目
 
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace('__main__.', '')  # module type
-        np = sum(x.numel() for x in m_.parameters())  # number params
+        # 创建模块对象
+        if n > 1:
+            # 需要进行模块重复，那么创建一个Sequential对象，里面包含重复的模块
+            m_ = nn.Sequential(*(m(*args) for _ in range(n)))
+        else:
+            # 直接创建模块
+            m_ = m(*args)
+        # m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        t = str(m)[8:-2].replace('__main__.', '')  # module type 模块类型字符串
+        np = sum(x.numel() for x in m_.parameters())  # number params 模块中的总参数量
+        # attach index --> 当前模块是第几层；  'from' index --> 当前模块的输入层是第几层；
+        # type --> 模块类型字符串；   number params ---> 模块中的总参数量
         m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
         LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
+        # save中保存模块输入的数据不是上一层的，这个对应的index
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
-        layers.append(m_)
+        layers.append(m_)  # 当前模块添加到layer list中
         if i == 0:
             ch = []
-        ch.append(c2)
+        ch.append(c2)  # 将当前模块的输出通道大小，保存到ch list中
+
+    # 结构构建及返回
     return nn.Sequential(*layers), sorted(save)
 
 

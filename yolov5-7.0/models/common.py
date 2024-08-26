@@ -21,6 +21,7 @@ import pandas as pd
 import requests
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from IPython.display import display
 from PIL import Image
 from torch.cuda import amp
@@ -118,26 +119,34 @@ class Bottleneck(nn.Module):
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+        z = self.cv2(self.cv1(x))  # 连续两个卷积进行特征提取
+        if self.add:
+            z = z + x  # 残差结构
+        return z
+        # return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
 class BottleneckCSP(nn.Module):
     # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
         super().__init__()
-        c_ = int(c2 * e)  # hidden channels
+        c_ = int(c2 * e)  # hidden channels  模块中间的卷积核数量默认为最终输出通道的一半
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = nn.Conv2d(c1, c_, 1, 1, bias=False)
         self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False)
         self.cv4 = Conv(2 * c_, c2, 1, 1)
         self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
         self.act = nn.SiLU()
+        # 残差块或者卷积 重复模块
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
-        y1 = self.cv3(self.m(self.cv1(x)))
-        y2 = self.cv2(x)
-        return self.cv4(self.act(self.bn(torch.cat((y1, y2), 1))))
+        y1 = self.cv3(self.m(self.cv1(x)))  # 第一条分支
+        y2 = self.cv2(x)  # 第二个分支
+        y = torch.cat((y1, y2), 1)  # 合并两个分支的数据
+        y = self.act(self.bn(y))  # bn + act激活
+        return self.cv4(y)  # 卷积融合输出
+        # return self.cv4(self.act(self.bn(torch.cat((y1, y2), 1))))
 
 
 class CrossConv(nn.Module):
@@ -158,14 +167,20 @@ class C3(nn.Module):
     # CSP Bottleneck with 3 convolutions
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
         super().__init__()
-        c_ = int(c2 * e)  # hidden channels
+        c_ = int(c2 * e)  # hidden channels  模块中间的卷积核数量默认为最终输出通道的一半
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        # 残差块或者卷积 重复模块
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
-        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+        y1 = self.m(self.cv1(x))  # 第一条分支
+        y2 = self.cv2(x)  # 第二条分支
+        y = torch.cat((y1, y2), 1)  # 合并两条分支
+        z = self.cv3(y)  # 分支通道卷积合并特征提取
+        return z
+        # return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
 class C3x(C3):
@@ -213,7 +228,9 @@ class SPP(nn.Module):
         x = self.cv1(x)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
-            return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
+            y = torch.cat([x] + [m(x) for m in self.m], 1)
+            return self.cv2(y)
+            # return self.cv2(torch.cat([x] + [m(x) for m in self.m], 1))
 
 
 class SPPF(nn.Module):
@@ -229,9 +246,12 @@ class SPPF(nn.Module):
         x = self.cv1(x)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
-            y1 = self.m(x)
-            y2 = self.m(y1)
-            return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
+            y1 = self.m(x)  # 第一次5*5的池化
+            y2 = self.m(y1)  # 第二次5*5的池化
+            y3 = self.m(y2)  # 第三次5*5的池化
+            y = torch.concat((x, y1, y2, y3), 1)  # 合并原始数据和三次池化的数据
+            return self.cv2(y)
+            # return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
 
 
 class Focus(nn.Module):
@@ -311,6 +331,65 @@ class Concat(nn.Module):
 
     def forward(self, x):
         return torch.cat(x, self.d)
+
+
+class Normalize(nn.Module):
+    def __init__(self, p: float = 2.0, dim: int = 1):
+        super(Normalize, self).__init__()
+        self.p = p
+        self.dim = dim
+
+    def forward(self, x):
+        return F.normalize(x, p=self.p, dim=self.dim)
+
+
+class DownSampling(nn.Module):
+    """
+    下采样方式：一般是不改变feature map大小的
+    -1. 卷积
+    -2. 池化
+    -3. 卷积 + 池化
+    """
+
+    def __init__(self, c1, c2, e=0.5):
+        super(DownSampling, self).__init__()
+        c_ = int(max(c2 * e, 1.0))  # 得到卷积下采样这个分支的输出通道的占比/数量
+        self.cv1 = Conv(c1, c_, k=1, s=1)
+        self.cv3 = Conv(c_, c_, k=3, s=2)
+        self.cv2 = Conv(c1, c2 - c_, k=1, s=1)
+        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=autopad(3))
+
+    def forward(self, x):
+        # 第一个分支的数据
+        z1 = self.cv3(self.cv1(x))
+        # 第二个分支的数据
+        z2 = self.pool(self.cv2(x))
+        # 合并两个分支的数据
+        z = torch.concat((z1, z2), dim=1)
+        return z
+
+
+class UpSampling(nn.Module):
+    def __init__(self, c1, c2, mode='nearest', e=0.5):
+        super(UpSampling, self).__init__()
+        c_ = int(max(c2 * e, 1.0))  # 得到反卷积上采样这个分支的输出通道的占比/数量
+        # noinspection PyTypeChecker
+        self.branch1 = nn.Sequential(
+            Conv(c1, c_, k=1, s=1),
+            nn.ConvTranspose2d(c_, c_, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(c_),
+            Conv.default_act
+        )
+        self.branch2 = nn.Sequential(
+            Conv(c1, c2 - c_, k=1, s=1),
+            nn.Upsample(None, 2, mode)
+        )
+
+    def forward(self, x):
+        z1 = self.branch1(x)
+        z2 = self.branch2(x)
+        z = torch.concat((z1, z2), dim=1)
+        return z
 
 
 class DetectMultiBackend(nn.Module):
