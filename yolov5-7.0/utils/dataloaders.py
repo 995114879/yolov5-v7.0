@@ -29,7 +29,7 @@ from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
 
 from utils.augmentations import (Albumentations, augment_hsv, classify_albumentations, classify_transforms, copy_paste,
-                                 letterbox, mixup, random_perspective)
+                                 letterbox, mixup, random_perspective, cutout)
 from utils.general import (DATASETS_DIR, LOGGER, NUM_THREADS, TQDM_BAR_FORMAT, check_dataset, check_requirements,
                            check_yaml, clean_str, cv2, is_colab, is_kaggle, segments2boxes, unzip_file, xyn2xy,
                            xywh2xyxy, xywhn2xyxy, xyxy2xywhn)
@@ -447,16 +447,16 @@ class LoadImagesAndLabels(Dataset):
                  pad=0.0,
                  min_items=0,
                  prefix=''):
-        self.img_size = img_size
-        self.augment = augment
-        self.hyp = hyp
-        self.image_weights = image_weights
+        self.img_size = img_size  # 图像尺度大小, eg: 640
+        self.augment = augment  # 是否做数据增强, eg: True
+        self.hyp = hyp  # 数据增强的超参数dict
+        self.image_weights = image_weights  # 是否做类别的加权抽样, eg: False
         self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic = self.augment and not self.rect  # 是否做mosaic数据增强 load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
-        self.stride = stride
+        self.stride = stride  # 缩放比例
         self.path = path
-        self.albumentations = Albumentations(size=img_size) if augment else None
+        self.albumentations = Albumentations(size=img_size) if augment else None  # 数据增强对象
 
         try:
             f = []  # image files
@@ -650,24 +650,24 @@ class LoadImagesAndLabels(Dataset):
     #     return self
 
     def __getitem__(self, index):
-        index = self.indices[index]  # linear, shuffled, or image_weights
+        index = self.indices[index]  # linear, shuffled, or image_weights indices保存的是图像index位置索引
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp['mosaic']
         if mosaic:
-            # Load mosaic
+            # Load mosaic 加载mosaic图像 --> mosaic图像的加载/拼接 + 数据增强(平移、缩放、旋转、剪切、透视变化)
             img, labels = self.load_mosaic(index)
             shapes = None
 
-            # MixUp augmentation
+            # MixUp augmentation MixUp数据增强
             if random.random() < hyp['mixup']:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.randint(0, self.n - 1)))
 
         else:
-            # Load image
+            # Load image 加载图像 + 等比例缩放(让最长边映射到需要的img_size大小)
             img, (h0, w0), (h, w) = self.load_image(index)
 
-            # Letterbox
+            # Letterbox 自适应的resize操作
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
@@ -687,32 +687,35 @@ class LoadImagesAndLabels(Dataset):
 
         nl = len(labels)  # number of labels
         if nl:
+            # 标签坐标位置转换(x1y1x2y2 -> xywh), 并且转换成百分比的形式
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
 
         if self.augment:
-            # Albumentations
+            # Albumentations 数据增强
             img, labels = self.albumentations(img, labels)
             nl = len(labels)  # update after albumentations
 
-            # HSV color-space
+            # HSV color-space hsv通道的数据增强
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
-            # Flip up-down
+            # Flip up-down 数据增强(上下翻转)
             if random.random() < hyp['flipud']:
                 img = np.flipud(img)
                 if nl:
                     labels[:, 2] = 1 - labels[:, 2]
 
-            # Flip left-right
+            # Flip left-right 数据增强(左右翻转)
             if random.random() < hyp['fliplr']:
                 img = np.fliplr(img)
                 if nl:
                     labels[:, 1] = 1 - labels[:, 1]
 
-            # Cutouts
+            # Cutouts 数据增强 Cutout
             # labels = cutout(img, labels, p=0.5)
             # nl = len(labels)  # update after cutout
 
+        # 类型转换及返回
+        # [M,6] M表示当前图像的边框数目，6分别为image_idx、label_class_idx、cx、cy、w、h
         labels_out = torch.zeros((nl, 6))
         if nl:
             labels_out[:, 1:] = torch.from_numpy(labels)
@@ -732,12 +735,12 @@ class LoadImagesAndLabels(Dataset):
             else:  # read image
                 im = cv2.imread(f)  # BGR
                 assert im is not None, f'Image Not Found {f}'
-            h0, w0 = im.shape[:2]  # orig hw
-            r = self.img_size / max(h0, w0)  # ratio
+            h0, w0 = im.shape[:2]  # orig hw 原始的图像大小
+            r = self.img_size / max(h0, w0)  # ratio 缩放比例
             if r != 1:  # if sizes are not equal
                 interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
-                im = cv2.resize(im, (int(w0 * r), int(h0 * r)), interpolation=interp)
-            return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
+                im = cv2.resize(im, (int(w0 * r), int(h0 * r)), interpolation=interp)  # 图像等比例缩放
+            return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized 图像，原始大小，resize后的图像大小
         return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
 
     def cache_images_to_disk(self, i):
@@ -746,37 +749,59 @@ class LoadImagesAndLabels(Dataset):
         if not f.exists():
             np.save(f.as_posix(), cv2.imread(self.im_files[i]))
 
-    def load_mosaic(self, index):
+    def load_mosaic(self, index, augment=True):
         # YOLOv5 4-mosaic loader. Loads 1 image + 3 random images into a 4-image mosaic
         labels4, segments4 = [], []
         s = self.img_size
-        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
-        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y 随机一个中心点
+        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices 随机选择4张图像
         random.shuffle(indices)
+        img, _, _ = self.load_image(index)
+        img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles 基础图像
         for i, index in enumerate(indices):
-            # Load image
+            # Load image 加载图像 OpenCV加载的图像对象、原始大小、resize后的大小
             img, _, (h, w) = self.load_image(index)
 
-            # place img in img4
-            if i == 0:  # top left
-                img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+            # place img in img4 计算当前图像的x1、y1、x2、y2，以及基础图像对应的x1、y1、x2、y2
+            if i == 0:  # top left 左上角
+                if xc < s and yc < s:
+                    r = random.uniform(0.5, 0.8)
+                    img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_AREA)  # 图像等比例缩放
+                    h, w = img.shape[:2]
+                # 当前图像的右下角一定和基础图像的中心点重叠
                 x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
-            elif i == 1:  # top right
+            elif i == 1:  # top right 右上角
+                if xc > s and yc < s:
+                    r = random.uniform(0.5, 0.8)
+                    img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_AREA)  # 图像等比例缩放
+                    h, w = img.shape[:2]
+                # 当前图像的左下角一定和基础图像的中心点重叠
                 x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
                 x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
             elif i == 2:  # bottom left
+                if xc < s and yc > s:
+                    r = random.uniform(0.5, 0.8)
+                    img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_AREA)  # 图像等比例缩放
+                    h, w = img.shape[:2]
+                # 当前图像的右上角一定和基础图像的中心点重叠
                 x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
             elif i == 3:  # bottom right
+                if xc > s and yc > s:
+                    r = random.uniform(0.5, 0.8)
+                    img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_AREA)  # 图像等比例缩放
+                    h, w = img.shape[:2]
+                # 当前图像的左上角一定和基础图像的中心点重叠
                 x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
                 x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
+            # 图像粘贴 --> 将当前图像粘贴到基础图像上
             img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
             padw = x1a - x1b
             padh = y1a - y1b
 
-            # Labels
+            # Labels 坐标位置的更改
             labels, segments = self.labels[index].copy(), self.segments[index].copy()
             if labels.size:
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
@@ -790,17 +815,18 @@ class LoadImagesAndLabels(Dataset):
             np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
         # img4, labels4 = replicate(img4, labels4)  # replicate
 
-        # Augment
-        img4, labels4, segments4 = copy_paste(img4, labels4, segments4, p=self.hyp['copy_paste'])
-        img4, labels4 = random_perspective(img4,
-                                           labels4,
-                                           segments4,
-                                           degrees=self.hyp['degrees'],
-                                           translate=self.hyp['translate'],
-                                           scale=self.hyp['scale'],
-                                           shear=self.hyp['shear'],
-                                           perspective=self.hyp['perspective'],
-                                           border=self.mosaic_border)  # border to remove
+        # Augment 数据增强
+        if augment:
+            img4, labels4, segments4 = copy_paste(img4, labels4, segments4, p=self.hyp['copy_paste'])
+            img4, labels4 = random_perspective(img4,
+                                               labels4,
+                                               segments4,
+                                               degrees=self.hyp['degrees'],
+                                               translate=self.hyp['translate'],
+                                               scale=self.hyp['scale'],
+                                               shear=self.hyp['shear'],
+                                               perspective=self.hyp['perspective'],
+                                               border=self.mosaic_border)  # border to remove
 
         return img4, labels4
 
@@ -885,7 +911,7 @@ class LoadImagesAndLabels(Dataset):
     def collate_fn(batch):
         im, label, path, shapes = zip(*batch)  # transposed
         for i, lb in enumerate(label):
-            lb[:, 0] = i  # add target image index for build_targets()
+            lb[:, 0] = i  # add target image index for build_targets() 给定边框对应的图像image_index
         return torch.stack(im, 0), torch.cat(label, 0), path, shapes
 
     @staticmethod
