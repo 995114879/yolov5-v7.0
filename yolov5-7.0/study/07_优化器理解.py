@@ -17,7 +17,7 @@ def t0(model, hyp):
     优化器：深度学习中进行参数更新的代码/方式，其实所有的优化器都是基于梯度的优化，本质上都是BP的过程
     不同优化器，只是在求解更新值的有所区别:
         常规的优化器/SGD: theta = theta - lr*gd, theta就是待更新的参数，lr是更新的学习率，gd就是损失loss关于参数theta的对应梯度值
-        包含L2惩罚性的SGD优化公式: theta = theta - lr*gd - weight_decay*theta
+        包含L2惩罚项的SGD优化公式: theta = theta - lr*gd - weight_decay*theta
     
     模型过拟合: 模型在训练数据上效果很好/预测正确，但是在测试/线上预测效果不好/预测不对；
         ---> 单纯考虑线性回归模型: pred_y = w * x + b
